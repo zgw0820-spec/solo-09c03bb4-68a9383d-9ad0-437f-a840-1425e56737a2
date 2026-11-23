@@ -1,0 +1,92 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>512e → 4Kn GPT 迁盘</title>
+  <link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+  <header class="topbar">
+    <h1>512e → 4Kn GPT 迁盘</h1>
+    <p class="subtitle">把 512 字节逻辑扇区的虚拟 RAW 盘，转换为等长的 4 KiB 逻辑扇区 GPT 镜像。</p>
+  </header>
+
+  <main>
+    <section class="card">
+      <h2>1. 选择源盘</h2>
+      <form id="upload-form" novalidate>
+        <label id="dropzone" class="dropzone" for="file-input">
+          <input id="file-input" name="file" type="file" accept=".img,.raw,.bin,application/octet-stream" hidden>
+          <span class="dz-icon" aria-hidden="true">⤒</span>
+          <span class="dz-title">点击选择或把 RAW 镜像拖到这里</span>
+          <span class="dz-hint" id="file-hint">正在读取服务端限制…</span>
+        </label>
+        <div class="actions">
+          <button type="submit" id="start-btn" class="primary" disabled>开始转换</button>
+          <button type="button" id="reset-btn" class="ghost" hidden>清空结果</button>
+        </div>
+      </form>
+
+      {% if samples %}
+      <div class="samples">
+        <h3>网页样盘（点击填入）</h3>
+        <div class="sample-grid">
+          {% for s in samples %}
+          <button type="button" class="sample-card" data-sample-key="{{ s.key }}" data-sample-name="{{ s.filename }}">
+            <span class="sample-title">{{ s.title }}</span>
+            <span class="sample-summary">{{ s.summary }}</span>
+            <span class="sample-tag {{ 'ok' if s.outcome == 'ok' else 'bad' }}">
+              {{ '应成功' if s.outcome == 'ok' else '应拒绝' }}
+            </span>
+          </button>
+          {% endfor %}
+        </div>
+      </div>
+      {% endif %}
+
+      <p class="note">
+        服务端以固定大小的块读写磁盘，内存占用与盘长无关。源文件与成品保存在服务端
+        临时卷中，任务完成 {{ (job_ttl_seconds // 60) }} 分钟后自动清理。
+      </p>
+    </section>
+
+    <section class="card" id="report-card" hidden>
+      <h2>2. 源盘检查与转换结果</h2>
+      <div id="banner" class="banner" hidden></div>
+      <div id="progress-wrap" class="progress-wrap" hidden>
+        <div class="progress"><div class="bar" id="progress-bar"></div></div>
+        <span id="progress-text" class="progress-text">—</span>
+      </div>
+      <dl id="meta" class="meta"></dl>
+      <div id="warnings" class="warnings" hidden></div>
+      <div id="copies" class="copies"></div>
+      <div id="checks" class="checks" hidden>
+        <h3>成品复验</h3>
+        <ul id="checks-list"></ul>
+      </div>
+      <div id="partitions" class="partitions" hidden>
+        <h3>分区（4 KiB LBA）</h3>
+        <div class="table-scroll">
+          <table>
+            <thead>
+              <tr><th>#</th><th>名称</th><th>类型 GUID</th><th>唯一 GUID</th><th>起始 LBA</th><th>结束 LBA</th><th>字节数</th></tr>
+            </thead>
+            <tbody id="partitions-body"></tbody>
+          </table>
+        </div>
+      </div>
+      <div id="download-wrap" class="download-wrap" hidden>
+        <a id="download-link" class="primary as-button" download>下载 4 KiB 镜像</a>
+        <span id="download-note" class="hint"></span>
+      </div>
+    </section>
+  </main>
+
+  <footer>
+    <span>约束：仅接受非混合 GPT、128 × 128 字节分区表；主备 GPT 独立校验，仅一份有效时使用该份；两份均损坏或互相矛盾时拒绝转换。盘长或分区边界未对齐 4 KiB、或新 GPT 与分区空间冲突时停止并说明原因。</span>
+  </footer>
+
+  <script src="/static/app.js" defer></script>
+</body>
+</html>
