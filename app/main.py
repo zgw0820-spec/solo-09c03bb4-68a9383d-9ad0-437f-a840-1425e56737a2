@@ -10,7 +10,12 @@ from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI, Request
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
+from fastapi.responses import (
+    FileResponse,
+    HTMLResponse,
+    JSONResponse,
+    Response,
+)
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from starlette.datastructures import UploadFile
@@ -18,20 +23,18 @@ from starlette.datastructures import UploadFile
 from .config import Settings, settings as default_settings
 from .errors import ConversionError
 from .jobs import Job, make_job_manager
+from .naming import clean_name, manifest_filename, output_filename
 from .samples import SAMPLES_BY_KEY, SampleCache
 
 logger = logging.getLogger("migrate")
 BASE_DIR = Path(__file__).resolve().parent
 UPLOAD_CHUNK = 4 * 1024 * 1024
 EXTERNAL_NAME_HEADER = "x-filename"
+OFFLINE_VERIFIER_PATH = "/api/verifier/offline.html"
 
 
 def _clean_name(raw: str | None) -> str:
-    if not raw:
-        return "disk.img"
-    name = raw.replace("\\", "/").rsplit("/", 1)[-1].strip()
-    name = "".join(ch for ch in name if ch.isprintable() and ch not in '"')
-    return name[:128] or "disk.img"
+    return clean_name(raw)
 
 
 def _upload_name_from_header(request: Request) -> str:
@@ -119,9 +122,57 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "max_upload_bytes": cfg.max_upload_bytes,
             "source_sector_size": 512,
             "target_sector_size": 4096,
+            "manifest_block_bytes": cfg.manifest_block_bytes,
+            "verifier_url": OFFLINE_VERIFIER_PATH,
             "samples": sample_catalog(),
             "job_ttl_seconds": cfg.job_ttl_seconds,
         }
+
+    @app.get("/verify", response_class=HTMLResponse)
+    async def verifier_page(request: Request) -> HTMLResponse:
+        """Online copy of the verifier; also offered as a one-file download."""
+        return templates.TemplateResponse(
+            request,
+            "verify.html",
+            {
+                "manifest_block_bytes": cfg.manifest_block_bytes,
+                "inline": False,
+            },
+        )
+
+    @app.get(OFFLINE_VERIFIER_PATH)
+    async def verifier_download() -> Response:
+        """Self-contained verifier (inline CSS/JS) for copying to the receiver.
+
+        The page is fully static once saved: no network calls, and the image
+        and manifest are read locally through the File API.
+        """
+        try:
+            html = templates.env.get_template("verify.html").render(
+                manifest_block_bytes=cfg.manifest_block_bytes,
+                inline=True,
+                inline_css=(BASE_DIR / "static" / "verify.css").read_text(
+                    encoding="utf-8"
+                ),
+                inline_js=(BASE_DIR / "static" / "verify.js").read_text(
+                    encoding="utf-8"
+                ),
+            )
+        except OSError:
+            return error_response(
+                ConversionError(
+                    "VERIFIER_MISSING", "离线校验页资源缺失。", status_code=500
+                )
+            )
+        return Response(
+            content=html,
+            media_type="text/html; charset=utf-8",
+            headers={
+                "Content-Disposition": 'attachment; filename="verify-4kn-image.html"',
+                "X-Content-Type-Options": "nosniff",
+                "Cache-Control": "no-store",
+            },
+        )
 
     @app.get("/api/samples")
     async def list_samples() -> dict[str, Any]:
@@ -303,35 +354,60 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         manager.discard(job_id)
         return JSONResponse({"deleted": job_id})
 
+    def _not_published(job: Job):
+        if job.status != "done" or job.error is not None:
+            return error_response(
+                ConversionError(
+                    "NOT_READY",
+                    "任务尚未完成或未通过复验，镜像与清单都不提供下载。",
+                    status_code=409,
+                )
+            )
+        if job.manifest_sha256 is None or not job.published:
+            return error_response(
+                ConversionError(
+                    "MANIFEST_NOT_READY",
+                    "镜像或分块校验清单缺失，已同时撤回下载。",
+                    status_code=409,
+                )
+            )
+        return None
+
     @app.get("/api/jobs/{job_id}/download")
     async def download(job_id: str):
         job: Job | None = manager.get(job_id)
         if job is None:
             return error_response(
-                ConversionError("JOB_NOT_FOUND", "找不到该任务。", status_code=404)
-            )
-        if job.status != "done" or job.error is not None:
-            return error_response(
                 ConversionError(
-                    "NOT_READY",
-                    "任务尚未完成或未通过复验，暂不可下载。",
-                    status_code=409,
+                    "JOB_NOT_FOUND", "找不到该任务，可能已过期或被删除。", status_code=404
                 )
             )
-        if not job.output_path.is_file():
-            return error_response(
-                ConversionError(
-                    "OUTPUT_MISSING", "成品文件已不存在（可能已过期）。", status_code=410
-                )
-            )
-        stem = _clean_name(job.source_name or "disk.img")
-        if stem.lower().endswith(".img"):
-            stem = stem[:-4]
-        filename = f"{stem}.4k.img"
+        blocked = _not_published(job)
+        if blocked is not None:
+            return blocked
         return FileResponse(
             job.output_path,
             media_type="application/octet-stream",
-            filename=filename,
+            filename=output_filename(job.source_name),
+            headers={"X-Content-Type-Options": "nosniff"},
+        )
+
+    @app.get("/api/jobs/{job_id}/manifest")
+    async def manifest_download(job_id: str):
+        job: Job | None = manager.get(job_id)
+        if job is None:
+            return error_response(
+                ConversionError(
+                    "JOB_NOT_FOUND", "找不到该任务，可能已过期或被删除。", status_code=404
+                )
+            )
+        blocked = _not_published(job)
+        if blocked is not None:
+            return blocked
+        return FileResponse(
+            job.manifest_path,
+            media_type="application/json",
+            filename=manifest_filename(job.source_name),
             headers={"X-Content-Type-Options": "nosniff"},
         )
 

@@ -76,9 +76,42 @@
           </table>
         </div>
       </div>
+      <div id="manifest-wrap" class="manifest-section" hidden>
+        <h3 class="plain">分块校验清单</h3>
+        <dl id="manifest-meta" class="meta"></dl>
+        <p class="note">
+          清单按固定块大小记录成品的 SHA-256，块范围从字节 0 连续覆盖到盘尾，
+          包括保护 MBR/主 GPT、分区内容、未分配区和盘尾不足一块的部分。值班员把清单
+          与镜像一起拷到接收机后，用下面的离线校验页逐块核对，本页不上传任何文件。
+        </p>
+        <div id="blocks-wrap" class="table-scroll" hidden>
+          <table>
+            <thead>
+              <tr><th>#</th><th>起始字节</th><th>块长度（字节）</th><th>SHA-256</th></tr>
+            </thead>
+            <tbody id="blocks-body"></tbody>
+          </table>
+        </div>
+        <p id="blocks-note" class="hint"></p>
+        <div id="regions-wrap" class="table-scroll" hidden>
+          <table>
+            <thead><tr><th>区域</th><th>起始字节</th><th>结束字节（不含）</th></tr></thead>
+            <tbody id="regions-body"></tbody>
+          </table>
+        </div>
+      </div>
       <div id="download-wrap" class="download-wrap" hidden>
         <a id="download-link" class="primary as-button" download>下载 4 KiB 镜像</a>
-        <span id="download-note" class="hint"></span>
+        <a id="manifest-link" class="secondary as-button" download>下载分块校验清单</a>
+        <a id="verifier-link" class="ghost as-button" href="/api/verifier/offline.html" download>另存离线校验页</a>
+      </div>
+      <div id="download-blocked" class="warnings" hidden></div>
+      <p class="note">
+        只有成品复验与清单生成都成功时才同时开放镜像、清单和离线校验页的下载；
+        复验失败或任务被取消时三者一起撤回。
+      </p>
+      <div class="download-wrap">
+        <a class="ghost as-button" href="/verify">在新窗口打开离线校验页</a>
       </div>
     </section>
   </main>

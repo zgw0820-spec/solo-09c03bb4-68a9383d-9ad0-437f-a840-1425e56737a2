@@ -22,16 +22,22 @@ from typing import Any
 from .converter import (
     SourceAnalysis,
     analyze_source,
+    build_image_manifest,
     convert,
     plan_layout,
     verify_output,
+    write_manifest_atomic,
 )
 from .errors import ConversionError, VerificationError
+from .naming import manifest_filename, output_filename
 
 JOB_ID_RE = re.compile(r"^[0-9a-f]{32}$")
 META_NAME = "job.json"
 SOURCE_NAME = "source.img"
 OUTPUT_NAME = "output-4k.img"
+MANIFEST_NAME = "manifest.json"
+BLOCK_BYTES = 4 * 1024 * 1024
+BLOCK_PREVIEW_LIMIT = 64
 
 
 @dataclass
@@ -43,10 +49,16 @@ class Job:
     status: str = "queued"  # queued|converting|verifying|done|failed
     copied_bytes: int = 0
     total_bytes: int = 0
+    verify_bytes: int = 0
     analysis: SourceAnalysis | None = None
     result_checks: list[str] = field(default_factory=list)
     error: dict[str, Any] | None = None
     source_name: str | None = None
+    manifest_sha256: str | None = None
+    block_count: int = 0
+    block_bytes: int = BLOCK_BYTES
+    block_preview: list[dict[str, Any]] = field(default_factory=list)
+    regions: list[dict[str, Any]] = field(default_factory=list)
     cancel: threading.Event = field(default_factory=threading.Event)
 
     @property
@@ -56,6 +68,10 @@ class Job:
     @property
     def output_path(self) -> Path:
         return self.dir / OUTPUT_NAME
+
+    @property
+    def manifest_path(self) -> Path:
+        return self.dir / MANIFEST_NAME
 
     def summary(self) -> dict[str, Any] | None:
         a = self.analysis
@@ -94,8 +110,24 @@ class Job:
             "warnings": a.warnings,
         }
 
+    def manifest_summary(self) -> dict[str, Any] | None:
+        published = self.published
+        return {
+            "block_bytes": self.block_bytes,
+            "block_count": self.block_count,
+            "sha256": self.manifest_sha256,
+            "filename": manifest_filename(self.source_name),
+            "download_url": (
+                f"/api/jobs/{self.id}/manifest" if published else None
+            ),
+            "blocks": self.block_preview,
+            "block_preview_limit": BLOCK_PREVIEW_LIMIT,
+            "regions": self.regions,
+            "published": published,
+        }
+
     def public(self) -> dict[str, Any]:
-        done = self.status == "done"
+        published = self.published
         return {
             "id": self.id,
             "status": self.status,
@@ -103,13 +135,33 @@ class Job:
             "updated_at": self.updated_at,
             "copied_bytes": self.copied_bytes,
             "total_bytes": self.total_bytes,
+            "verify_bytes": self.verify_bytes,
             "source_name": self.source_name,
             "summary": self.summary(),
             "checks": self.result_checks,
             "error": self.error,
-            "download_url": f"/api/jobs/{self.id}/download" if done else None,
-            "output_size": self.total_bytes if done else None,
+            "manifest": self.manifest_summary(),
+            "download_url": (
+                f"/api/jobs/{self.id}/download" if published else None
+            ),
+            "output_size": self.total_bytes if published else None,
         }
+
+    @property
+    def published(self) -> bool:
+        """Both the image and its manifest exist and passed verification."""
+        return (
+            self.status == "done"
+            and bool(self.manifest_sha256)
+            and self.output_path.is_file()
+            and self.manifest_path.is_file()
+        )
+
+    def drop_published(self) -> None:
+        """Withdraw the image and the manifest together."""
+        self.manifest_sha256 = None
+        self.output_path.unlink(missing_ok=True)
+        self.manifest_path.unlink(missing_ok=True)
 
 
 class JobManager:
@@ -121,11 +173,13 @@ class JobManager:
         chunk_size: int = 4 * 1024 * 1024,
         job_ttl_seconds: int = 3600,
         max_upload_bytes: int = 8 * 1024**3,
+        block_bytes: int = BLOCK_BYTES,
     ) -> None:
         self.work_dir = Path(work_dir)
         self.chunk_size = chunk_size
         self.job_ttl_seconds = job_ttl_seconds
         self.max_upload_bytes = max_upload_bytes
+        self.block_bytes = block_bytes
         self._jobs: dict[str, Job] = {}
         self._lock = threading.RLock()
         self._queue: queue.Queue[str | None] = queue.Queue()
@@ -277,7 +331,7 @@ class JobManager:
                     "message": "任务已取消。",
                     "details": {},
                 }
-                job.output_path.unlink(missing_ok=True)
+                job.drop_published()
                 self._write_meta(job)
             return job.public()
 
@@ -304,7 +358,7 @@ class JobManager:
                 self._fail(
                     job,
                     "OUTPUT_VERIFICATION_FAILED",
-                    "成品复验未通过，已删除输出文件，拒绝提供下载。",
+                    "成品复验未通过，已删除镜像和清单，拒绝提供下载。",
                     {"reasons": exc.reasons},
                 )
             except Exception as exc:  # pragma: no cover - defensive
@@ -316,8 +370,12 @@ class JobManager:
                 )
             finally:
                 if job.status != "done":
-                    job.output_path.unlink(missing_ok=True)
+                    job.drop_published()
                 self._write_meta(job)
+
+    def _check_cancel(self, job: Job) -> None:
+        if job.cancel.is_set() or job.status == "failed":
+            raise ConversionError("CANCELLED", "任务已取消。", status_code=409)
 
     def _run_job(self, job: Job) -> None:
         analysis = job.analysis
@@ -359,20 +417,64 @@ class JobManager:
         finally:
             os.close(src_fd)
 
-        if job.cancel.is_set() or job.status == "failed":
-            # Cancelled during the copy; the API already explained it.
-            raise ConversionError("CANCELLED", "任务已取消。", status_code=409)
+        self._check_cancel(job)
 
         self._set_status(job, "verifying")
         job.copied_bytes = analysis.disk_size
         self._write_meta(job)
 
-        checks = verify_output(str(job.output_path), result)
-        job.result_checks = checks
-        job.source_path.unlink(missing_ok=True)
-        self._set_status(job, "done")
-        job.updated_at = time.time()
-        self._write_meta(job)
+        # Verification and manifest creation share a single sequential read
+        # of the finished image; the source disk is not copied a second time.
+        def verify_progress(scanned: int) -> None:
+            if job.cancel.is_set():
+                raise ConversionError("CANCELLED", "任务已取消。", status_code=409)
+            job.verify_bytes = scanned
+
+        report = verify_output(
+            str(job.output_path),
+            result,
+            block_bytes=self.block_bytes,
+            chunk_size=self.chunk_size,
+            progress=verify_progress,
+        )
+        job.result_checks = report.checks
+        self._check_cancel(job)
+
+        image_name = output_filename(job.source_name)
+        manifest = build_image_manifest(
+            str(job.output_path),
+            result,
+            image_name=image_name,
+            source_name=job.source_name or "",
+            block_bytes=self.block_bytes,
+        )
+        job.block_count = manifest.block_count
+        job.block_bytes = manifest.block_bytes
+        job.block_preview = [
+            {
+                "index": b.index,
+                "offset": b.offset,
+                "length": b.length,
+                "sha256": b.sha256,
+            }
+            for b in manifest.blocks[:BLOCK_PREVIEW_LIMIT]
+        ]
+        job.regions = [
+            {"kind": r.kind, "start": r.start, "end": r.end, "label": r.label}
+            for r in manifest.regions
+        ]
+        digest = write_manifest_atomic(str(job.manifest_path), manifest)
+
+        # Publication is atomic under the lock: a cancel that arrives after
+        # the manifest is written still wins and withdraws both files.
+        with self._lock:
+            if job.cancel.is_set() or job.status == "failed":
+                raise ConversionError("CANCELLED", "任务已取消。", status_code=409)
+            job.source_path.unlink(missing_ok=True)
+            job.manifest_sha256 = digest
+            job.status = "done"
+            job.updated_at = time.time()
+            self._write_meta(job)
 
     def _set_status(self, job: Job, status: str) -> None:
         job.status = status
@@ -393,7 +495,7 @@ class JobManager:
         }
         job.status = "failed"
         job.updated_at = time.time()
-        job.output_path.unlink(missing_ok=True)
+        job.drop_published()
         self._write_meta(job)
 
     def _write_meta(self, job: Job) -> None:
@@ -416,4 +518,5 @@ def make_job_manager(settings: Any) -> JobManager:
         chunk_size=settings.copy_chunk_bytes,
         job_ttl_seconds=settings.job_ttl_seconds,
         max_upload_bytes=settings.max_upload_bytes,
+        block_bytes=settings.manifest_block_bytes,
     )

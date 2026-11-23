@@ -1,0 +1,107 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>4Kn 镜像分块校验（离线）</title>
+{#- This template is rendered twice:
+    - online at /verify (static assets linked, no inline script needed)
+    - downloaded at /api/verifier/offline.html (CSS and JS inlined, one file)
+    In both modes the page is fully local: no upload, no server calls. -#}
+{% if inline %}
+<style>
+{{ inline_css | safe }}
+</style>
+{% else %}
+<link rel="stylesheet" href="/static/verify.css">
+{% endif %}
+</head>
+<body>
+<header class="topbar">
+  <h1>4Kn 镜像分块校验</h1>
+  <p class="subtitle">
+    在接收机上核对从迁盘结果页下载的镜像与分块校验清单。文件只在本机浏览器内读取，
+    不上传、不联网。适合把本页另存为单个 HTML 文件后随 U 盘一起带到接收机。
+  </p>
+</header>
+
+<main>
+  <section class="card">
+    <h2>1. 选择清单与镜像</h2>
+    <div class="pick-grid">
+      <label class="dropzone" id="manifest-drop" for="manifest-input">
+        <input id="manifest-input" type="file" accept=".json,application/json" hidden>
+        <span class="dz-icon" aria-hidden="true">{ }</span>
+        <span class="dz-title">分块校验清单（*.manifest.json）</span>
+        <span class="dz-hint" id="manifest-hint">尚未选择清单</span>
+      </label>
+      <label class="dropzone" id="image-drop" for="image-input">
+        <input id="image-input" type="file" accept=".img,.raw,.bin,application/octet-stream" hidden>
+        <span class="dz-icon" aria-hidden="true">⛁</span>
+        <span class="dz-title">本地镜像（*.4k.img / *.img）</span>
+        <span class="dz-hint" id="image-hint">尚未选择镜像</span>
+      </label>
+    </div>
+    <div class="actions">
+      <button type="button" id="verify-btn" class="primary" disabled>开始逐块核对</button>
+      <button type="button" id="reset-btn" class="ghost">清空</button>
+      {% if not inline %}
+      <a class="ghost as-button" href="/api/verifier/offline.html" download id="offline-link">另存离线校验页</a>
+      {% endif %}
+    </div>    <p class="note">
+      默认按清单声明的块大小（服务端为 {{ (manifest_block_bytes // 1024 // 1024) }} MiB）
+      逐块计算 SHA-256。校验只读本地文件内容，不上传、不联网；另存为单文件后用
+      <code>file://</code> 打开时使用浏览器 Web Crypto，其余情况自动改用页面内置的
+      SHA-256 实现。
+    </p>
+  </section>
+
+  <section class="card" id="result-card" hidden>
+    <h2>2. 核对结果</h2>
+    <div id="banner" class="banner" hidden></div>
+    <div id="progress-wrap" class="progress-wrap" hidden>
+      <div class="progress"><div class="bar" id="progress-bar"></div></div>
+      <span id="progress-text" class="progress-text">—</span>
+    </div>
+    <dl id="meta" class="meta"></dl>
+    <div id="mismatch-wrap" hidden>
+      <h3>不匹配块</h3>
+      <div class="table-scroll">
+        <table>
+          <thead>
+            <tr><th>#</th><th>起始字节</th><th>块长度（字节）</th><th>清单 SHA-256</th><th>本地 SHA-256</th></tr>
+          </thead>
+          <tbody id="mismatch-body"></tbody>
+        </table>
+      </div>
+      <div class="actions">
+        <a id="mismatch-download" class="secondary as-button" href="#" download>下载不匹配块清单（CSV）</a>
+      </div>
+    </div>
+    <div id="regions-wrap" hidden>
+      <h3>镜像区域（供定位重拷范围）</h3>
+      <div class="table-scroll">
+        <table>
+          <thead><tr><th>区域</th><th>起始字节</th><th>结束字节（不含）</th></tr></thead>
+          <tbody id="regions-body"></tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+</main>
+
+<footer>
+  <span>核对规则：镜像长度必须与清单声明完全一致；清单必须从字节 0 起连续覆盖到镜像末尾
+    （含 GPT、未分配区和不足一块的盘尾），任一条件不满足即拒绝核对并说明原因。
+    长度相符但内容不符时，列出每个不匹配块的起始字节与长度。</span>
+</footer>
+
+{% if inline %}
+<script>
+{{ inline_js | safe }}
+</script>
+{% else %}
+<script src="/static/verify.js" defer></script>
+{% endif %}
+</body>
+</html>

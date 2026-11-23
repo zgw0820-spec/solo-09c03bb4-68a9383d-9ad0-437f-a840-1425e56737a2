@@ -36,6 +36,7 @@
 }
 
 * { box-sizing: border-box; }
+[hidden] { display: none !important; }
 
 body {
   margin: 0;
@@ -217,6 +218,11 @@ td.mono { font-family: ui-monospace, Menlo, monospace; }
 
 .download-wrap { margin-top: 1.3rem; display: flex; flex-wrap: wrap; align-items: center; gap: .8rem; }
 .hint { color: var(--muted); font-size: .85rem; }
+
+.manifest-section { margin-top: 1.2rem; }
+.manifest-section h3.plain { margin-top: 0; }
+.manifest-section .table-scroll { margin-top: .6rem; }
+.manifest-section table td.mono { word-break: break-all; white-space: normal; }
 
 footer {
   max-width: 1040px;

@@ -9,11 +9,13 @@ from typing import Callable
 from .errors import ConversionError, VerificationError
 from .gpt import (
     COPY_CHUNK,
+    BlockDigest,
     GPTHeader,
     GPTLayout,
     GPTValidationError,
     Partition,
     PartitionIssues,
+    VerificationResult,
     build_layout,
     check_partitions,
     copy_with_partition_hashes,
@@ -26,6 +28,14 @@ from .gpt import (
     reserved_tail_bytes,
     verify_layout_image,
     write_layout,
+)
+from .manifest import (
+    MANIFEST_VERSION,
+    Manifest,
+    build_manifest,
+    manifest_bytes,
+    manifest_sha256,
+    read_manifest_file,
 )
 
 SOURCE_SECTOR_SIZE = 512
@@ -273,6 +283,7 @@ class ConversionResult:
     layout: GPTLayout
     checks: list[str]
     partition_hashes: dict[int, str]
+    block_hashes: list[BlockDigest] = field(default_factory=list)
 
 
 def plan_layout(analysis: SourceAnalysis) -> GPTLayout:
@@ -331,12 +342,78 @@ def convert(
     )
 
 
-def verify_output(path: str, result: ConversionResult) -> list[str]:
-    """Mandatory re-open/verify pass; raises if any check fails."""
+def verify_output(
+    path: str,
+    result: ConversionResult,
+    *,
+    block_bytes: int,
+    chunk_size: int = COPY_CHUNK,
+    progress: Callable[[int], None] | None = None,
+) -> VerificationResult:
+    """Mandatory re-open/verify pass; raises if any check fails.
+
+    Partition content hashes and the per-block manifest hashes come from the
+    same sequential read of the finished image.
+    """
     report = verify_layout_image(
-        path, result.layout, expected_hashes=result.partition_hashes
+        path,
+        result.layout,
+        expected_hashes=result.partition_hashes,
+        hash_chunk=chunk_size,
+        block_bytes=block_bytes,
+        progress=progress,
     )
     result.checks = report.checks
     if not report.ok:
         raise VerificationError(report.reasons)
-    return report.checks
+    result.block_hashes = report.block_hashes or []
+    return report
+
+
+def build_image_manifest(
+    path: str,
+    result: ConversionResult,
+    *,
+    image_name: str,
+    source_name: str,
+    block_bytes: int,
+) -> Manifest:
+    """Create the manifest from the hashes of the verified single pass."""
+    if not result.block_hashes:
+        raise VerificationError(["缺少分块哈希，未通过复验的镜像不能生成清单"])
+    manifest = build_manifest(
+        image_name=image_name,
+        layout=result.layout,
+        blocks=result.block_hashes,
+        block_bytes=block_bytes,
+        source_name=source_name,
+    )
+    if manifest.image_size != os.path.getsize(path):
+        raise VerificationError(
+            [
+                f"清单镜像长度 {manifest.image_size} 与成品 "
+                f"{os.path.getsize(path)} 不一致"
+            ]
+        )
+    return manifest
+
+
+def write_manifest_atomic(path: str, manifest: Manifest) -> str:
+    """Write the manifest atomically; return its SHA-256.
+
+    The freshly written file is re-read through the same strict validator the
+    browser uses, so a torn or incomplete manifest is never published.
+    """
+    data = manifest_bytes(manifest)
+    tmp = path + ".tmp"
+    with open(tmp, "wb") as handle:
+        handle.write(data)
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(tmp, path)
+    stored = read_manifest_file(path)
+    if stored.to_dict() != manifest.to_dict():
+        raise VerificationError(["写出的清单与生成结果不一致"])
+    if stored.version != MANIFEST_VERSION:
+        raise VerificationError(["写出的清单版本不合格"])
+    return manifest_sha256(path)

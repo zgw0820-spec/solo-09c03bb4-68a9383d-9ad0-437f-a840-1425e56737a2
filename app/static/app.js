@@ -78,6 +78,10 @@ function resetUI() {
   $("checks").hidden = true;
   $("partitions").hidden = true;
   $("download-wrap").hidden = true;
+  $("manifest-wrap").hidden = true;
+  $("blocks-wrap").hidden = true;
+  $("regions-wrap").hidden = true;
+  $("download-blocked").hidden = true;
   $("warnings").hidden = true;
   $("copies").replaceChildren();
   $("meta").replaceChildren();
@@ -201,6 +205,12 @@ function renderFailure(error) {
     $("banner").append(el("div", { class: "hint", text: `错误代码：${error.code}` }));
   }
   $("download-wrap").hidden = true;
+  $("manifest-wrap").hidden = true;
+  $("download-blocked").hidden = false;
+  $("download-blocked").replaceChildren(
+    el("strong", { text: "下载未开放：" }),
+    document.createTextNode("镜像与分块校验清单都不提供下载。")
+  );
   $("reset-btn").hidden = false;
 }
 
@@ -246,8 +256,13 @@ function renderJob(job) {
     let pct = Math.min(100, (job.copied_bytes / total) * 100);
     let label = `${STATUS_TEXT[job.status] || job.status} · ${formatBytes(job.copied_bytes)} / ${formatBytes(job.total_bytes)}`;
     if (job.status === "verifying") {
-      pct = 100;
-      label = "正在逐区复验成品…";
+      if (job.verify_bytes) {
+        pct = Math.min(100, (job.verify_bytes / total) * 100);
+        label = `复验并计算分块哈希 · ${formatBytes(job.verify_bytes)} / ${formatBytes(job.total_bytes)}`;
+      } else {
+        pct = 100;
+        label = "正在逐区复验成品并生成分块哈希…";
+      }
     }
     $("progress-bar").style.width = `${pct}%`;
     $("progress-text").textContent = label;
@@ -271,13 +286,39 @@ function renderJob(job) {
     for (const check of checks) list.append(el("li", { text: check }));
   }
 
-  if (job.status === "done" && job.download_url) {
+  if (job.status === "done" && job.download_url && job.manifest && job.manifest.download_url) {
     $("download-wrap").hidden = false;
+    $("download-blocked").hidden = true;
+    $("manifest-wrap").hidden = false;
+    const base = (job.source_name || "disk.img").replace(/\.img$/i, "") || "disk";
     const link = $("download-link");
     link.href = job.download_url;
-    link.setAttribute("download", (job.source_name || "disk.img").replace(/\.img$/i, "") + ".4k.img");
-    $("download-note").textContent = `成品 ${formatBytes(job.output_size)} · 复验已通过`;
-    setBanner("ok", "转换完成，成品已通过独立复验，可下载。");
+    link.setAttribute("download", `${base}.4k.img`);
+    const manifestLink = $("manifest-link");
+    manifestLink.href = job.manifest.download_url;
+    manifestLink.setAttribute("download", job.manifest.filename);
+
+    const manifestMeta = $("manifest-meta");
+    manifestMeta.replaceChildren();
+    const rows = [
+      ["文件名", job.manifest.filename],
+      ["分块大小", formatBytes(job.manifest.block_bytes)],
+      ["块数量", String(job.manifest.block_count)],
+      ["清单 SHA-256", job.manifest.sha256],
+    ];
+    for (const [key, value] of rows) {
+      manifestMeta.append(el("div", {}, [el("dt", { text: key }), el("dd", { text: value })]));
+    }
+    renderManifestDetail(job.manifest);
+    setBanner("ok", "转换完成，成品复验通过且分块校验清单已生成，可同时下载镜像、清单和离线校验页。");
+  } else if (job.status === "done") {
+    $("download-wrap").hidden = true;
+    $("manifest-wrap").hidden = true;
+    $("download-blocked").hidden = false;
+    $("download-blocked").replaceChildren(
+      el("strong", { text: "下载未开放：" }),
+      document.createTextNode("镜像或清单未同时就绪，两者都不提供下载。")
+    );
   }
 }
 
@@ -360,6 +401,53 @@ function renderSummary(summary) {
         el("td", { class: "mono", text: String(part.start_lba_4k) }),
         el("td", { class: "mono", text: String(part.end_lba_4k) }),
         el("td", { class: "mono", text: formatBytes(part.byte_end_exclusive - part.byte_start) }),
+      ])
+    );
+  }
+}
+
+function renderManifestDetail(manifest) {
+  const blocks = manifest.blocks || [];
+  const wrap = $("blocks-wrap");
+  const body = $("blocks-body");
+  body.replaceChildren();
+  if (!blocks.length) {
+    wrap.hidden = true;
+    $("blocks-note").textContent = "";
+  } else {
+    wrap.hidden = false;
+    for (const block of blocks) {
+      body.append(
+        el("tr", {}, [
+          el("td", { text: String(block.index) }),
+          el("td", { class: "mono", text: String(block.offset) }),
+          el("td", { class: "mono", text: String(block.length) }),
+          el("td", { class: "mono", text: block.sha256 }),
+        ])
+      );
+    }
+    const limit = manifest.block_preview_limit || blocks.length;
+    $("blocks-note").textContent =
+      manifest.block_count > blocks.length
+        ? `仅显示前 ${blocks.length} 块（共 ${manifest.block_count} 块，预览上限 ${limit}）；完整清单见下载文件。`
+        : `共 ${manifest.block_count} 块，已全部列出。`;
+  }
+
+  const regions = manifest.regions || [];
+  const regionWrap = $("regions-wrap");
+  const regionBody = $("regions-body");
+  regionBody.replaceChildren();
+  if (!regions.length) {
+    regionWrap.hidden = true;
+    return;
+  }
+  regionWrap.hidden = false;
+  for (const region of regions) {
+    regionBody.append(
+      el("tr", {}, [
+        el("td", { text: region.label ? `${region.label}（${region.kind}）` : region.kind }),
+        el("td", { class: "mono", text: String(region.start) }),
+        el("td", { class: "mono", text: String(region.end) }),
       ])
     );
   }

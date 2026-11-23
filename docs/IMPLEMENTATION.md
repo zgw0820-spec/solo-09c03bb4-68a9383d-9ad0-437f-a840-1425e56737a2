@@ -7,14 +7,18 @@
 
 ```
 app/
-  gpt.py        纯 GPT/CRC/分区表逻辑：解析、校验、重建、逐字节复验
-  converter.py  两份副本的取舍、4 KiB 前置条件、流式复制编排
-  jobs.py       磁盘任务、单/多工作线程、进度、取消、TTL 清理
-  main.py       FastAPI 路由与上传流
+  gpt.py        纯 GPT/CRC/分区表逻辑：解析、校验、重建、单次顺序读复验
+  manifest.py   4 MiB 分块 SHA-256 清单：生成、严格校验、原子落盘
+  naming.py     成品/清单的下载文件名
+  converter.py  两份副本的取舍、4 KiB 前置条件、流式复制编排、清单生成
+  jobs.py       磁盘任务、单/多工作线程、进度、取消、TTL 清理、发布门控
+  main.py       FastAPI 路由、上传流、镜像/清单/离线校验页下载
   samples.py    5 个网页样盘场景（按需生成）
   samplegen.py  造盘/篡改工具（测试、样盘、命令行共用）
   config.py     环境变量配置
-tests/          43 个测试（GPT 单元、转换端到端、HTTP 层）
+app/templates/verify.html   离线校验页（同一模板渲染在线 /verify 与单文件下载）
+app/static/verify.js|css    校验页前端（单文件下载时内联）
+tests/          57 个测试（GPT 单元、转换端到端、清单、HTTP 层）
 tools/make_sample.py  生成/自检提交在仓库里的 64 MiB→16 MiB 样盘
 ```
 
@@ -67,8 +71,53 @@ MBR 之后到 `FirstUsableLBA` 的全部旧数据以及盘尾保留区，再写�
 `verify_layout_image()` 重新打开成品文件，从头解析主备 GPT、保护 MBR，
 对照重建布局逐字节比对保留区，并把每个分区的 SHA-256 与**复制期间从源盘
 算出**的哈希比对。哈希在 `copy_with_partition_hashes()` 的同一遍顺序读里
-完成，不会额外整盘读源。复验失败时工作线程删除输出，下载接口只认
-`status == "done"`。
+完成，不会额外整盘读源。
+
+成品复验与分块清单共用**同一次顺序读盘**：`scan_and_hash()` 从字节 0 读到
+盘尾，一边按分区范围喂分区哈希，一边按 4 MiB 边界喂分块哈希。因此复验
+只读一遍成品、不另存整盘副本；`test_verification_reads_the_image_once`
+断言整次复验读取的字节数只比镜像长度多出 GPT 表头/保留区那几十 KiB。
+
+复验失败时工作线程删除镜像与清单，下载接口只认 `published`（`done` 且
+`manifest_sha256` 非空且两个文件都在）。
+
+### 分块校验清单
+
+`manifest.build_manifest()` 用复验同一次读盘得到的分块哈希生成清单：
+
+- `blocks`：每块 `index / offset / length / sha256`，从字节 0 连续覆盖到盘尾；
+  最后一块可以短于 4 MiB。校验器要求 `len(blocks)` 与按长度算出的块数相等、
+  每块 `offset` 紧接上一块、`length` 等于 `min(block_bytes, image_size-offset)`、
+  且末块结束恰为 `image_size`，即**覆盖保护 MBR/GPT、分区内容、未分配区和
+  盘尾**，不允许有缺口。
+- `regions`：把镜像切成 `gpt-head / partition / unallocated / gpt-tail` 四类
+  区域，同样无缝覆盖整盘，便于值班员把不匹配块映射到需要重拷的区间。
+
+`write_manifest_atomic()` 通过临时文件 + `os.replace` 落盘，随后用与浏览器
+**同一套严格校验逻辑**（`validate_manifest`）重读一遍，确保不会发布残缺清单。
+
+### 发布门控
+
+工作线程在锁内完成“取消检查 + 置 `done` + 记录清单哈希”，因此发布与取消
+不会交错：复验或清单任一失败、或发布前收到取消，`_fail`/`drop_published`
+会把镜像和清单一起删除，`download_url`、`manifest.download_url` 同时为空。
+HTTP 层对两个下载接口再做一次 `published` 检查（文件被人为删除时也返回 409）。
+
+### 离线校验页
+
+`app/templates/verify.html` 渲染两种形态：
+
+- `/verify`：在线访问，链接 `/static/verify.css|js`；
+- `/api/verifier/offline.html`：`Content-Disposition: attachment`，把 CSS/JS
+  内联成**单个 HTML 文件**，接收方另存后双击（`file://`）即可使用。
+
+页面不发起任何网络请求：清单用 `File.text()` + `JSON.parse` 读取，镜像用
+`File.slice()` 逐块 `arrayBuffer()`。长度与清单声明不符、或清单不完整
+（块数/连续性/覆盖范围任一不符）时**在计算任何哈希之前**拒绝并列出原因；
+长度相符时逐块比较 SHA-256，只把不匹配的块列成表（起始字节 + 长度 +
+两侧哈希），并可导出 CSV。`crypto.subtle` 仅在安全上下文可用（`file://`
+算安全上下文），因此页面内置了纯 JS SHA-256 作为非安全上下文（如
+`http://<内网IP>`）的回退。
 
 ### 内存
 
@@ -86,14 +135,17 @@ MBR 之后到 `FirstUsableLBA` 的全部旧数据以及盘尾保留区，再写�
 
 ```
 $ python3 -m pytest -q
-43 passed, 1 warning in 41.12s
+57 passed, 1 warning in 31.29s
 ```
 
 覆盖：正常转换、主表坏、备表坏、双表坏、磁盘 GUID 冲突、分区项冲突、
 混合 MBR、分区未对齐、盘长未对齐、新主/备 GPT 空间冲突、保护 MBR 缺失
 重建、空表项残留、GUID/属性/名称保留、成品被篡改（GPT 区与分区内容）、
 复制读取块大小上限、盘长不足以容纳 4 KiB GPT、HTTP 上传/下载/取消/TTL/
-孤儿目录/大小上限/非 ASCII 文件名。
+孤儿目录/大小上限/非 ASCII 文件名；新增清单覆盖范围（含盘尾短块、GPT、
+未分配区）、清单缺口/缺块/长度不符的拒绝、复验单次顺序读盘、
+复验失败与清单写入失败时下载一起撤回、发布前取消不开放下载、
+离线校验页为单文件且不含网络调用。
 
 ### 2. 试跑：单表损坏
 
@@ -140,6 +192,27 @@ BOTH_GPT_INVALID`（附两份副本各自的失败原因）。
 对正常样盘与单表损坏样盘的成品各跑一遍独立校验脚本（纯 `os.pread` +
 `struct` + `zlib`，不 import 本应用任何模块），结果 `PASS`。
 
+### 6. 网页端到端自测（Chromium + Playwright）
+
+用 `uvicorn` 启动应用，在无头 Chromium 中走真实网页流程：
+
+- 首页 5 个样盘渲染；点选“正常样盘”上传 → 11 项复验全过（最后一项
+  “整盘顺序读取 16777216 字节，生成 4 个分块 SHA-256”），结果页显示清单
+  文件名、4 MiB 块大小、4 块与清单 SHA-256；镜像（16 777 216 字节）与清单
+  （1 785 字节）都从页面按钮成功下载。
+- 从页面“另存离线校验页”保存单文件 HTML（29 548 字节），以 `file://`
+  打开（`isSecureContext=true`），网络请求记录为空：
+  - 正确的镜像 + 清单 → “逐块核对通过：4 块全部与清单一致”；
+  - 篡改块 2 内 1 字节 → 仅列出块 2，起始字节 `8388608`、长度 `4194304`，
+    并给出清单/本地两侧 SHA-256；
+  - 镜像截短 4 096 字节 → 未读内容即拒绝：“镜像长度不符，拒绝核对”，
+    给出两侧长度与差值；
+  - 清单删掉最后一块 → 拒绝：“清单 blocks 实际 3 项，与声明的 4 块不符 /
+    清单块只覆盖到字节 12582912，镜像共 16777216 字节，清单不完整”。
+- 点选“空间冲突”样盘 → 页面红条列出重叠区间与未对齐边界，下载区隐藏并
+  显示“镜像与分块校验清单都不提供下载”。
+- 页面 console 与 `pageerror` 均无报错。
+
 ## 待办 / 已知限制
 
 - **Docker 镜像未在本机构建验证**（无 docker/podman 可用）。Dockerfile 与
@@ -151,3 +224,7 @@ BOTH_GPT_INVALID`（附两份副本各自的失败原因）。
   没有跨副本的任务存储/队列，故默认单 worker。
 - 未做认证、限流与磁盘配额；公网部署前需要补。
 - 尚未在真实 4Kn 虚拟机/硬件中验证引导，只做了镜像级校验。
+- 清单未签名：可发现拷贝损坏/拷错，但不能防御对清单本身的主动篡改；需要时
+  应在带外核对结果页/清单文件自身的 SHA-256。
+- 纯 JS SHA-256 回退路径只针对非安全上下文（如 `http://<内网IP>`）；功能已
+  经浏览器实测，但大镜像下明显慢于 Web Crypto。

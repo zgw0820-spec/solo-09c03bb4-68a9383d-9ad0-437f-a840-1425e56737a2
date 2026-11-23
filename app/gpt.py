@@ -844,10 +844,137 @@ def copy_with_partition_hashes(
     return {h.index: h.digest.hexdigest() for h in hashers}
 
 
+@dataclass(frozen=True)
+class BlockDigest:
+    """SHA-256 of one fixed-size slice of the finished image."""
+
+    index: int
+    offset: int
+    length: int
+    sha256: str
+
+
+@dataclass
+class ScanHashes:
+    """Digests produced by one sequential pass over the image."""
+
+    scanned_bytes: int
+    read_calls: int
+    blocks: list[BlockDigest] | None
+    partitions: dict[int, str]
+
+
+def scan_and_hash(
+    fd: int,
+    device_size: int,
+    ranges: Sequence[tuple[int, int, int]],
+    *,
+    block_bytes: int | None = None,
+    chunk_size: int = COPY_CHUNK,
+    progress: Callable[[int], None] | None = None,
+) -> ScanHashes:
+    """Read ``[0, device_size)`` once, hashing blocks and byte ranges.
+
+    ``ranges`` yields ``(index, start_byte, end_byte_exclusive)`` and is hashed
+    incrementally as the sequential cursor passes it.  ``block_bytes`` turns on
+    a second set of digest contexts, one per consecutive slice of the image;
+    the final slice may be shorter.  At most one ``chunk_size`` buffer is held.
+    """
+    if chunk_size <= 0:
+        raise ValueError("chunk_size must be positive")
+    if block_bytes is not None and block_bytes <= 0:
+        raise ValueError("block_bytes must be positive")
+
+    pending = sorted(ranges, key=lambda item: (item[1], item[2], item[0]))
+    active: list[tuple[int, int, int, hashlib._Hash]] = []
+    done: dict[int, str] = {}
+    for index, start, end in pending:
+        if start < 0 or end < start or end > device_size:
+            raise ValueError("hash range outside the image")
+
+    block_hasher = hashlib.sha256() if block_bytes is not None else None
+    blocks: list[BlockDigest] | None = [] if block_bytes is not None else None
+    block_index = 0
+    block_fill = 0
+
+    offset = 0
+    scanned = 0
+    read_calls = 0
+    while offset < device_size:
+        want = min(chunk_size, device_size - offset)
+        data = pread_exact(fd, want, offset)
+        read_calls += 1
+        chunk_end = offset + want
+
+        while pending and pending[0][1] < chunk_end:
+            index, start, end = pending.pop(0)
+            active.append((index, start, end, hashlib.sha256()))
+        still: list[tuple[int, int, int, hashlib._Hash]] = []
+        for index, start, end, digest in active:
+            lo = max(start, offset)
+            hi = min(end, chunk_end)
+            if lo < hi:
+                digest.update(data[lo - offset : hi - offset])
+            if end > chunk_end:
+                still.append((index, start, end, digest))
+            else:
+                done[index] = digest.hexdigest()
+        active = still
+
+        if block_bytes is not None and block_hasher is not None:
+            pos = 0
+            while pos < want:
+                take = min(block_bytes - block_fill, want - pos)
+                block_hasher.update(data[pos : pos + take])
+                block_fill += take
+                pos += take
+                if block_fill == block_bytes:
+                    assert blocks is not None
+                    blocks.append(
+                        BlockDigest(
+                            index=block_index,
+                            offset=block_index * block_bytes,
+                            length=block_bytes,
+                            sha256=block_hasher.hexdigest(),
+                        )
+                    )
+                    block_index += 1
+                    block_fill = 0
+                    block_hasher = hashlib.sha256()
+
+        offset = chunk_end
+        scanned += want
+        if progress is not None:
+            progress(scanned)
+
+    if pending or active:
+        raise RuntimeError("hash ranges were not fully covered")
+    if block_bytes is not None and block_fill:
+        assert blocks is not None and block_hasher is not None
+        blocks.append(
+            BlockDigest(
+                index=block_index,
+                offset=block_index * block_bytes,
+                length=block_fill,
+                sha256=block_hasher.hexdigest(),
+            )
+        )
+
+    return ScanHashes(
+        scanned_bytes=scanned,
+        read_calls=read_calls,
+        blocks=blocks,
+        partitions=done,
+    )
+
+
 @dataclass
 class VerificationResult:
     checks: list[str] = field(default_factory=list)
     reasons: list[str] = field(default_factory=list)
+    block_hashes: list[BlockDigest] | None = None
+    partition_hashes: dict[int, str] = field(default_factory=dict)
+    scanned_bytes: int = 0
 
     @property
     def ok(self) -> bool:
@@ -860,6 +987,8 @@ def verify_layout_image(
     *,
     expected_hashes: dict[int, str] | None = None,
     hash_chunk: int = COPY_CHUNK,
+    block_bytes: int | None = None,
+    progress: Callable[[int], None] | None = None,
 ) -> VerificationResult:
     """Re-open a produced image and verify it against ``layout``."""
     result = VerificationResult()
@@ -971,41 +1100,61 @@ def verify_layout_image(
             else:
                 result.checks.append("成品分区边界对齐且不与新 GPT 区域重叠")
 
-            if expected_hashes is not None:
-                hashes_ok = True
+            if expected_hashes is not None or block_bytes is not None:
+                # One sequential pass over the produced image serves both the
+                # per-partition content re-check and the 4 MiB block manifest.
+                # No second copy of the disk is made.
+                ranges = []
                 for part in actual_parts:
-                    expected = expected_hashes.get(part.index)
-                    if expected is None:
-                        result.reasons.append(
-                            f"分区 {part.index} 缺少源内容哈希，无法复验"
-                        )
-                        hashes_ok = False
-                        continue
                     start, end = part.byte_range(layout.sector_size)
-                    digest = hashlib.sha256()
-                    offset = start
-                    while offset < end:
-                        want = min(hash_chunk, end - offset)
-                        try:
-                            data = pread_exact(fd, want, offset)
-                        except EOFError:
-                            result.reasons.append(
-                                f"成品分区 {part.index} 内容截断"
-                                f"（字节 {offset}）"
-                            )
-                            hashes_ok = False
-                            break
-                        digest.update(data)
-                        offset += want
-                    if digest.hexdigest() != expected:
-                        result.reasons.append(
-                            f"分区 {part.index} 内容哈希与源盘不一致"
-                        )
-                        hashes_ok = False
-                if hashes_ok:
-                    result.checks.append(
-                        "各分区内容 SHA-256 与源盘逐区一致"
+                    if 0 <= start <= end <= layout.device_size:
+                        ranges.append((part.index, start, end))
+                if size != layout.device_size:
+                    result.reasons.append(
+                        "成品长度不符，跳过分区内容与分块哈希复验"
                     )
+                else:
+                    scan = scan_and_hash(
+                        fd,
+                        layout.device_size,
+                        ranges,
+                        block_bytes=block_bytes,
+                        chunk_size=hash_chunk,
+                        progress=progress,
+                    )
+                    result.partition_hashes = scan.partitions
+                    result.block_hashes = scan.blocks
+                    result.scanned_bytes = scan.scanned_bytes
+                    if expected_hashes is not None:
+                        hashes_ok = True
+                        for part in actual_parts:
+                            expected = expected_hashes.get(part.index)
+                            if expected is None:
+                                result.reasons.append(
+                                    f"分区 {part.index} 缺少源内容哈希，无法复验"
+                                )
+                                hashes_ok = False
+                                continue
+                            actual = scan.partitions.get(part.index)
+                            if actual is None:
+                                result.reasons.append(
+                                    f"分区 {part.index} 内容读取失败，无法复验"
+                                )
+                                hashes_ok = False
+                            elif actual != expected:
+                                result.reasons.append(
+                                    f"分区 {part.index} 内容哈希与源盘不一致"
+                                )
+                                hashes_ok = False
+                        if hashes_ok:
+                            result.checks.append(
+                                "各分区内容 SHA-256 与源盘逐区一致"
+                            )
+                    if scan.blocks is not None:
+                        result.checks.append(
+                            f"整盘顺序读取 {scan.scanned_bytes} 字节，生成 "
+                            f"{len(scan.blocks)} 个分块 SHA-256"
+                        )
 
         expected_head, expected_tail = layout.expected_reserved_bytes()
         try:

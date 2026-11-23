@@ -11,6 +11,7 @@ services:
       MIGRATE_JOB_TTL_SECONDS: "${MIGRATE_JOB_TTL_SECONDS:-3600}"
       MIGRATE_COPY_CHUNK_BYTES: "${MIGRATE_COPY_CHUNK_BYTES:-4194304}"
       MIGRATE_MAX_CONCURRENT_JOBS: "${MIGRATE_MAX_CONCURRENT_JOBS:-1}"
+      MIGRATE_MANIFEST_BLOCK_BYTES: "${MIGRATE_MANIFEST_BLOCK_BYTES:-4194304}"
     volumes:
       - jobs:/data/jobs
     # The image runs as an unprivileged user and needs no kernel capabilities:

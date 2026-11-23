@@ -30,6 +30,7 @@ class Settings:
     sample_dir: Path | None
     sample_cache_dir: Path
     sample_download_name: str
+    manifest_block_bytes: int = 4 * 1024 * 1024
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -54,6 +55,9 @@ class Settings:
             sample_cache_dir=sample_cache_dir,
             sample_download_name=os.environ.get(
                 "MIGRATE_SAMPLE_NAME", "sample-512b-gpt.img"
+            ),
+            manifest_block_bytes=_int_env(
+                "MIGRATE_MANIFEST_BLOCK_BYTES", 4 * 1024 * 1024
             ),
         )
 
